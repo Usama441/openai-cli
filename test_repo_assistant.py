@@ -29,14 +29,14 @@ def test_build_project_snapshot_reads_repo_files_and_readme():
         assert "print('hello')" in snapshot["src/app.py"]
 
 
-def test_build_chat_prompt_keeps_previous_prompt_context():
+def test_build_chat_prompt_keeps_previous_prompt_context(tmp_path):
     history = [
         "User: read the project",
         "Assistant: here is the repo overview",
         "User: explain the auth flow",
     ]
 
-    prompt = build_chat_prompt("/tmp/project", "what files are involved in login?", history)
+    prompt = build_chat_prompt(str(tmp_path), "what files are involved in login?", history)
 
     assert "Previous conversation" in prompt
     assert "read the project" in prompt

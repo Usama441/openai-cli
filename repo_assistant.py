@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import sys
@@ -7,6 +8,17 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from openai import OpenAI
+
+# Windows consoles often default to a legacy codepage (e.g. cp1252) that cannot
+# encode the box-drawing characters and other Unicode used in this CLI's output
+# (banners, chat headers, and model-generated text). Force UTF-8 stdout/stderr so
+# printing never crashes the process mid-task.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
 
 
 class Colors:
@@ -348,13 +360,15 @@ def build_chat_prompt(project_path: str | Path, task: str, history: List[str] | 
             history_lines.append(f"- {message.strip()}")
         history_lines.append("")
 
+    history_text = "\n".join(history_lines)
+
     return f"""
 You are an expert repository code assistant.
 
 Use only the relevant files below for this task.
 Do not load the entire repository unless the user explicitly requests a full-project dump.
 
-{'\n'.join(history_lines)}Relevant files:
+{history_text}Relevant files:
 {context}
 
 User task:
@@ -367,6 +381,12 @@ Instructions:
 - Keep the answer concise.
 - Mention only important files directly related to the request.
 - Do not invent functions, classes, or APIs that are not present.
+- If the task requires creating, editing, deleting a file or folder, or running a command,
+  respond with ONLY a JSON object of the form {{"tool_calls":[{{"tool":"write_file","arguments":{{"path":"path/to/file","content":"full file contents"}}}}]}}.
+  Valid tools are: write_file(path, content), read_file(path), list_directory(path),
+  delete_file(path), mkdir(path), run_command(command, cwd).
+  Use mkdir to create folders and write_file to create or overwrite files.
+  Do not wrap the JSON in markdown fences or add any commentary when returning tool_calls.
 """.strip() + "\n"
 
 
@@ -387,6 +407,93 @@ def ask_code_editor(project_path: str | Path, task: str, model: str | None = Non
         max_output_tokens=1024,
     )
     return response.output_text
+
+
+def _summarize_tool_results(tool_results: List[Dict]) -> str:
+    lines: List[str] = []
+    for result in tool_results:
+        tool_name = result.get("tool", "unknown")
+        ok = result.get("ok", False)
+        details = []
+        if result.get("path"):
+            details.append(f"path={result['path']}")
+        if result.get("stdout"):
+            details.append(f"stdout={result['stdout'].strip()[:200]}")
+        if result.get("stderr"):
+            details.append(f"stderr={result['stderr'].strip()[:200]}")
+        if result.get("error"):
+            details.append(f"error={result['error']}")
+        if not details:
+            details.append("no extra details")
+        status = "ok" if ok else "failed"
+        lines.append(f"- {tool_name}: {status} | {'; '.join(details)}")
+    return "\n".join(lines)
+
+
+def run_task_project(
+    project_path: str | Path,
+    task: str,
+    model: str | None = None,
+    base_url: str | None = None,
+    history: List[str] | None = None,
+    max_iterations: int = 5,
+) -> str:
+    """Ask the model for a plan and actually execute any tool calls it returns.
+
+    Unlike ask_code_editor (which only returns raw model text), this drives a
+    small tool-use loop so requests like "create a file/folder" are actually
+    applied to the filesystem via tools.filesystem.execute_tool_call.
+    """
+    from tools.filesystem import execute_tool_call, parse_tool_calls_from_model_text, validate_tool_call
+
+    conversation_history = list(history) if history else []
+    all_summaries: List[str] = []
+    previous_calls: str | None = None
+
+    for _ in range(max_iterations):
+        model_text = ask_code_editor(
+            project_path=project_path,
+            task=task,
+            model=model,
+            base_url=base_url,
+            history=conversation_history,
+        )
+
+        tool_calls = parse_tool_calls_from_model_text(model_text)
+        if not tool_calls:
+            if all_summaries:
+                return "\n\n".join(all_summaries) + f"\n\n{model_text.strip()}"
+            return model_text.strip()
+
+        # Guard against a model that keeps re-issuing the same tool calls
+        # instead of recognizing the task is already done.
+        calls_signature = json.dumps(tool_calls, sort_keys=True)
+        if calls_signature == previous_calls:
+            all_summaries.append("(stopped: model repeated the same tool calls, treating task as complete)")
+            break
+        previous_calls = calls_signature
+
+        tool_results = []
+        for call in tool_calls:
+            validated = validate_tool_call(call)
+            if not validated["ok"]:
+                tool_results.append({"tool": call.get("tool"), "ok": False, "error": validated["error"]})
+                continue
+            result = execute_tool_call(validated, base_dir=str(project_path))
+            tool_results.append({"tool": validated["tool"], "ok": result.get("ok", False), **result})
+
+        summary = _summarize_tool_results(tool_results)
+        all_summaries.append(summary)
+
+        conversation_history.append(f"User: {task}")
+        conversation_history.append(
+            f"Assistant: Executed tools:\n{summary}\n"
+            "These actions are already completed. Do not repeat them. "
+            "If the task is now fully done, reply with a short plain-text confirmation "
+            "and no tool_calls JSON. Only emit further tool_calls for genuinely new steps."
+        )
+
+    return "\n\n".join(all_summaries) if all_summaries else "Reached max iterations without a final answer."
 
 
 def main() -> None:
@@ -435,7 +542,7 @@ def main() -> None:
 
             try:
                 print_status("AI thinking...")
-                result = ask_code_editor(
+                result = run_task_project(
                     project_path=args.project_path,
                     task=task,
                     model=args.model,
@@ -467,7 +574,7 @@ def main() -> None:
 
     try:
         print_status("AI thinking...")
-        result = ask_code_editor(
+        result = run_task_project(
             project_path=args.project_path,
             task=args.task,
             model=args.model,
@@ -479,6 +586,7 @@ def main() -> None:
         raise SystemExit(1) from exc
 
     print_chat_header("AI")
+    print(wrap_text(result))
 
 
 if __name__ == "__main__":

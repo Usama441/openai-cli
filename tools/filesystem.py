@@ -144,36 +144,59 @@ def validate_tool_call(call: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "tool": tool_name, "arguments": args}
 
 
-def write_file(path: str, content: str) -> dict[str, Any]:
-    file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(content, encoding="utf-8")
-    return {"ok": True, "path": str(file_path), "bytes": len(content.encode("utf-8"))}
+def resolve_path(path: str, base_dir: str | None = None) -> Path:
+    candidate = Path(path).expanduser()
+    if base_dir and not candidate.is_absolute():
+        candidate = Path(base_dir).expanduser() / candidate
+    return candidate
 
 
-def read_file(path: str) -> dict[str, Any]:
-    text = Path(path).read_text(encoding="utf-8")
-    return {"ok": True, "path": path, "content": text}
+def write_file(path: str, content: str, base_dir: str | None = None) -> dict[str, Any]:
+    try:
+        file_path = resolve_path(path, base_dir)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+        return {"ok": True, "path": str(file_path), "bytes": len(content.encode("utf-8"))}
+    except OSError as exc:
+        return {"ok": False, "path": path, "error": str(exc)}
 
 
-def list_directory(path: str) -> dict[str, Any]:
-    root = Path(path)
-    return {"ok": True, "path": str(root), "items": [p.name for p in sorted(root.iterdir())]}
+def read_file(path: str, base_dir: str | None = None) -> dict[str, Any]:
+    try:
+        file_path = resolve_path(path, base_dir)
+        text = file_path.read_text(encoding="utf-8")
+        return {"ok": True, "path": str(file_path), "content": text}
+    except OSError as exc:
+        return {"ok": False, "path": path, "error": str(exc)}
 
 
-def delete_file(path: str) -> dict[str, Any]:
-    file_path = Path(path)
-    file_path.unlink(missing_ok=True)
-    return {"ok": True, "path": str(file_path)}
+def list_directory(path: str, base_dir: str | None = None) -> dict[str, Any]:
+    try:
+        root = resolve_path(path, base_dir)
+        return {"ok": True, "path": str(root), "items": [p.name for p in sorted(root.iterdir())]}
+    except OSError as exc:
+        return {"ok": False, "path": path, "error": str(exc)}
 
 
-def mkdir(path: str) -> dict[str, Any]:
-    directory = Path(path)
-    directory.mkdir(parents=True, exist_ok=True)
-    return {"ok": True, "path": str(directory)}
+def delete_file(path: str, base_dir: str | None = None) -> dict[str, Any]:
+    try:
+        file_path = resolve_path(path, base_dir)
+        file_path.unlink(missing_ok=True)
+        return {"ok": True, "path": str(file_path)}
+    except OSError as exc:
+        return {"ok": False, "path": path, "error": str(exc)}
 
 
-def execute_tool_call(raw: str | dict[str, Any]) -> dict[str, Any]:
+def mkdir(path: str, base_dir: str | None = None) -> dict[str, Any]:
+    try:
+        directory = resolve_path(path, base_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        return {"ok": True, "path": str(directory)}
+    except OSError as exc:
+        return {"ok": False, "path": path, "error": str(exc)}
+
+
+def execute_tool_call(raw: str | dict[str, Any], base_dir: str | None = None) -> dict[str, Any]:
     if isinstance(raw, str):
         try:
             call = json.loads(raw)
@@ -190,17 +213,17 @@ def execute_tool_call(raw: str | dict[str, Any]) -> dict[str, Any]:
     args = validated["arguments"]
 
     if tool_name == "write_file":
-        return write_file(args["path"], args["content"])
+        return write_file(args["path"], args["content"], base_dir)
     if tool_name == "read_file":
-        return read_file(args["path"])
+        return read_file(args["path"], base_dir)
     if tool_name == "list_directory":
-        return list_directory(args["path"])
+        return list_directory(args["path"], base_dir)
     if tool_name == "delete_file":
-        return delete_file(args["path"])
+        return delete_file(args["path"], base_dir)
     if tool_name == "mkdir":
-        return mkdir(args["path"])
+        return mkdir(args["path"], base_dir)
     if tool_name == "run_command":
         from tools.terminal import run_command
-        return run_command(args["command"], args.get("cwd"))
+        return run_command(args["command"], args.get("cwd") or base_dir)
 
     return {"ok": False, "error": f"Unknown tool: {tool_name}"}

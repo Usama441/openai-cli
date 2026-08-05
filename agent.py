@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any, List
 
 from openai import OpenAI
@@ -10,6 +11,16 @@ from memory import ConversationMemory
 from planner import Planner
 from prompts import build_chat_prompt
 from tools.filesystem import execute_tool_call, parse_tool_calls_from_model_text, validate_tool_call
+
+# Windows consoles often default to a legacy codepage that cannot encode
+# arbitrary Unicode in model-generated output. Force UTF-8 so printing never
+# crashes the process mid-task.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
 
 
 class RepoAgent:
@@ -105,7 +116,7 @@ class RepoAgent:
             if not validated["ok"]:
                 results.append({"tool": call.get("tool"), "ok": False, "error": validated["error"]})
                 continue
-            result = execute_tool_call(validated)
+            result = execute_tool_call(validated, base_dir=self.project_path)
             results.append({"tool": validated["tool"], "ok": result.get("ok", False), **result})
         return results
 
